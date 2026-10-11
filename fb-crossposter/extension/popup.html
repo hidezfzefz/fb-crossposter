@@ -17,6 +17,8 @@ input[type=text],input[type=number]{width:100%;padding:6px 8px;border:1px solid 
 .conn{font-size:12px;padding:6px;border-radius:6px;text-align:center;margin-bottom:8px}
 .conn.yes{background:#dbeafe;color:#1e40af}
 .conn.no{background:#fee2e2;color:#991b1b}
+label.chk{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:#4b5563;margin-top:2px}
+label.chk input{width:auto;margin:0}
 </style></head><body>
 <h2>📋 FB Post Copier</h2>
 <div id="connStatus" class="conn no">🔴 Python backend not connected (optional)</div>
@@ -30,6 +32,12 @@ input[type=text],input[type=number]{width:100%;padding:6px 8px;border:1px solid 
 <div class="section"><div class="section-title">Groups</div>
 <div class="field"><label>Source Group (FROM)</label><input type="text" id="sourceUrl"></div>
 <div class="field"><label>Target Group (TO)</label><input type="text" id="targetUrl"></div>
+</div>
+
+<div class="section"><div class="section-title">🔍 Scanning</div>
+<div class="field"><label>Minimum scan interval (seconds, min 60)</label><input type="number" id="scanInterval" min="60" step="30"></div>
+<label class="chk"><input type="checkbox" id="activateOnScan"> Show the source tab while scanning</label>
+<p style="font-size:11px;color:#9ca3af;margin:6px 0 0">The source group tab is kept open and the scan resumes where the last one stopped, so each cycle reads the posts it has not seen yet.</p>
 </div>
 
 <div class="section"><div class="section-title">🐍 Python Backend</div>

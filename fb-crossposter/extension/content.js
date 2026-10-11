@@ -1,8 +1,15 @@
-// content.js — FB Post Copier v9.1
+// content.js — FB Post Copier v9.3
 // Runs on every facebook.com page.
 //   * Manual mode: adds "+ Copy" / "+ Add" buttons to posts.
 //   * Automation: answers "auto_scan" (incremental, cursor-style) and "do_post"
 //     (composer flow) messages from the background script / Python backend.
+//
+// v9.3 — the source feed scan keeps a PERSISTENT SCROLL CURSOR (see autoScan).
+//   Facebook only loads more posts when you scroll DOWN, and it renders the same
+//   newest-first posts at the top on every visit. The old scan re-anchored to the
+//   top and stopped after a fixed nudge, so every cycle re-read the same posts,
+//   deduped them and reported "0 new posts" forever. Now each cycle checks the top
+//   for brand-new posts and then RESUMES at the depth the previous scan stopped.
 //
 // CRITICAL fixes kept from earlier iterations (do not remove):
 //   * double-injection guard — otherwise onMessage registers twice → same post posted twice
@@ -18,8 +25,11 @@
   var COPIER_BTN_CLASS = "fb-copier-btn";
   var COPIER_POST_CLASS = "fb-copier-post";
   var PROCESSED_ATTR = "data-fb-copier-processed";
-  var MAX_SEEN_KEYS = 1000;   // local cursor memory (bounded)
-  var MAX_WALK = 45;          // post elements inspected per scan
+  var MAX_SEEN_KEYS = 1000;   // local seen-post memory (bounded)
+  var MAX_WALK = 90;          // post elements inspected per scan
+  var MAX_SCROLL_STEPS = 12;  // downward infinite-scroll steps per scan
+  var TOP_SWEEP_POSTS = 10;   // newest posts checked at the top of the feed
+  var SCAN_CURSOR_MAX_AGE_MS = 6 * 60 * 60 * 1000;  // older cursor → start over
   var settings = { includeImages: true, includeLink: true };
 
   // ------------------------------------------------------------------
@@ -29,6 +39,13 @@
   var scanRunning = false;    // re-entrancy guard (two scans must never overlap)
   var composerModal = null;   // the modal we opened, so completion checks are reliable
   var postingInThisTab = false; // re-entrancy guard (one do_post at a time per tab)
+
+  // ------------------------------------------------------------------
+  // Scan cursor: where this tab stopped scrolling last cycle.
+  // Persisted so progress survives cycles AND tab reloads — without it every
+  // scan restarts at the top and never reaches posts it has not seen yet.
+  // ------------------------------------------------------------------
+  var cursor = { group: "", depthY: 0, atBottom: false, savedAt: 0 };
 
   function log(m) { console.log("[FB Copier] " + m); }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -55,6 +72,36 @@
       browser.storage.local.set({ scanSeenKeys: arr });
     } catch (e) {}
   }
+
+  // ------------------------------------------------------------------
+  // Feed cursor (see autoScan)
+  // ------------------------------------------------------------------
+  function currentGroupKey() {
+    var m = /\/groups\/([^/?#]+)/.exec(location.pathname + location.search);
+    return m ? m[1] : "";
+  }
+  function loadCursor() {
+    try {
+      return browser.storage.local.get("scanCursor").then(function (r) {
+        var c = r.scanCursor;
+        if (!c || typeof c !== "object") return;
+        if (c.group && currentGroupKey() && c.group !== currentGroupKey()) { log("Scan cursor belongs to another group — starting over"); return; }
+        if (!c.savedAt || Date.now() - c.savedAt > SCAN_CURSOR_MAX_AGE_MS) { log("Scan cursor is stale — starting over from the top"); return; }
+        cursor = { group: c.group || "", depthY: Number(c.depthY) || 0, atBottom: !!c.atBottom, savedAt: c.savedAt };
+        log("Scan cursor: depth=" + Math.round(cursor.depthY) + "px atBottom=" + cursor.atBottom);
+      }, function () {});
+    } catch (e) { return Promise.resolve(); }
+  }
+  function saveCursor() {
+    try {
+      cursor.group = currentGroupKey(); cursor.savedAt = Date.now();
+      browser.storage.local.set({ scanCursor: cursor });
+    } catch (e) {}
+  }
+  function resetCursor() {
+    cursor = { group: "", depthY: 0, atBottom: false, savedAt: 0 };
+    saveCursor();
+  }
   // Local content key — same idea as the backend hash (normalized text + first image URL).
   // Only used to avoid re-sending posts we already handled; the Python hash is authoritative.
   function contentKey(pd) {
@@ -65,6 +112,7 @@
   }
   loadSettings();
   loadSeenKeys();
+  var cursorReady = loadCursor();
 
   // ------------------------------------------------------------------
   // On-page status toast
@@ -382,6 +430,7 @@
     if (message.action === "clear_scan_keys") {
       seenKeys = new Set();
       try { browser.storage.local.set({ scanSeenKeys: [] }); } catch (e) {}
+      resetCursor();   // forget the feed position too — start from the top again
       log("Scan cursor cleared");
       sendResponse({ ok: true });
       return false;
@@ -389,9 +438,11 @@
   });
 
   // ------------------------------------------------------------------
-  // Incremental auto scan (cursor-style)
-  //  - re-anchors to the top so we always see the newest posts
-  //  - skips posts already sent (local cursor + backend hash dedup)
+  // Incremental auto scan (persistent feed cursor)
+  //  Phase A — sweep the top of the feed: that is where brand-new posts appear.
+  //  Phase B — resume at the depth the previous scan stopped and keep scrolling
+  //            DOWN until new posts appear, the feed ends, or the budget is spent.
+  //  - skips posts already sent (local seen-key cursor; the Python hash is authoritative)
   //  - only downloads images for NEW posts
   //  - never runs twice at the same time
   // ------------------------------------------------------------------
@@ -399,38 +450,91 @@
     if (scanRunning) { log("Scan skipped: another scan is already running"); return { ok: false, busy: true, posts: [], error: "scan already running" }; }
     scanRunning = true;
     try {
-      log("=== AUTO SCAN (max " + maxPosts + ") ===");
-      // 1. Re-anchor to the newest posts (the previous cycle scrolled down).
-      window.scrollTo(0, 0);
-      await sleep(1500);
-      // 2. Nudge the feed so recent posts (and their lazy images) are rendered.
-      for (var i = 0; i < 3; i++) { window.scrollBy(0, 900); await sleep(1500); }
-
-      var posts = findPosts(document.body);
-      log("Found " + posts.length + " post elements");
+      maxPosts = Math.max(1, parseInt(maxPosts, 10) || 12);
+      await cursorReady;
       var results = [];
-      var walked = 0;
-      for (var j = 0; j < posts.length; j++) {
-        if (results.length >= maxPosts || walked >= MAX_WALK) break;
-        walked++;
-        try {
-          await clickSeeMore(posts[j]);
-          var pd = extractPostData(posts[j]);
-          if (!pd.text && pd.images.length === 0 && !pd.link) continue;
-          var key = contentKey(pd);
-          if (key && seenKeys.has(key)) continue;   // already handled — don't re-download/re-send
-          if (pd.images.length > 0) pd.imagesBase64 = await downloadImagesAsBase64(pd.images); else pd.imagesBase64 = [];
-          if (key) seenKeys.add(key);
-          results.push(pd);
-          log("New post " + results.length + ": " + (pd.text || "").substring(0, 40).replace(/\n/g, " "));
-        } catch (e) { log("Post " + walked + " failed: " + e.message); }
+      var inspected = new Set();   // post elements already looked at during THIS scan
+      var walked = 0, steps = 0, crawled = false;
+      log("=== AUTO SCAN (max " + maxPosts + ", resume at " + Math.round(cursor.depthY) + "px) ===");
+
+      // Phase A — newest posts. Cheap: already-seen posts are recognized by key and skipped.
+      window.scrollTo(0, 0);
+      await sleep(1200);
+      walked += await harvestNewPosts(results, inspected, maxPosts, TOP_SWEEP_POSTS);
+      log("Top sweep: " + results.length + " new post(s)");
+
+      // Phase B — continue where the previous scan stopped, so Facebook's infinite
+      // scroll keeps surfacing posts we have never inspected.
+      if (results.length < maxPosts) {
+        if (cursor.atBottom) { log("Previous scan reached the end of the feed — starting a fresh pass"); cursor.atBottom = false; cursor.depthY = 0; }
+        if (cursor.depthY > 0) { window.scrollTo(0, cursor.depthY); await sleep(1500); }
+        crawled = true;
+        var stalls = 0;
+        var lastHeight = document.documentElement.scrollHeight;
+        while (results.length < maxPosts && steps < MAX_SCROLL_STEPS && walked < MAX_WALK) {
+          walked += await harvestNewPosts(results, inspected, maxPosts, MAX_WALK - walked);
+          if (results.length >= maxPosts || walked >= MAX_WALK) break;
+          var prevY = window.scrollY;
+          window.scrollBy(0, Math.max(700, Math.round(window.innerHeight * 0.9)));
+          steps++;
+          await sleep(1600);   // let Facebook's infinite scroll fetch and render
+          var height = document.documentElement.scrollHeight;
+          // The feed ended: the page neither grew nor moved (checked twice in a row).
+          if (height <= lastHeight + 200 && window.scrollY <= prevY) {
+            if (++stalls >= 2) { cursor.atBottom = true; log("End of the source feed reached"); break; }
+          } else stalls = 0;
+          lastHeight = height;
+          log("Scroll step " + steps + ": y=" + Math.round(window.scrollY) + "px, " + results.length + " new post(s) so far");
+        }
       }
+
       saveSeenKeys();
-      log("Scan done: " + results.length + " new post(s), " + walked + " inspected");
-      return { ok: true, posts: results };
+      // Remember where we stopped. At the feed end the next cycle starts over from
+      // the top (seen-key dedup makes that pass cheap) so nothing is missed; a
+      // reloaded page may have clamped us shallower, so the cursor never goes back up.
+      if (cursor.atBottom) cursor.depthY = 0;
+      else if (crawled) cursor.depthY = Math.max(cursor.depthY, window.scrollY);
+      saveCursor();
+      log("Scan done: " + results.length + " new post(s), " + walked + " inspected, " + steps + " scroll step(s), depth " + Math.round(cursor.depthY) + "px" + (cursor.atBottom ? ", feed end" : ""));
+      return { ok: true, posts: results, cursor: { depthY: cursor.depthY, atBottom: cursor.atBottom }, inspected: walked, steps: steps };
     } finally {
       scanRunning = false;
     }
+  }
+
+  // Posts scrolled past the top of the viewport were already covered by an earlier
+  // pass (we resume where the last scan stopped), so re-reading them would only waste
+  // the walk budget — and on a long feed that would stall the cursor for good.
+  function isAboveViewport(el) {
+    try { return el.getBoundingClientRect().bottom < 0; } catch (e) { return false; }
+  }
+
+  // Extract every not-yet-seen post currently rendered, up to `budget` unseen elements.
+  // Seen posts still count against the budget: running out of unseen posts is the
+  // signal that we must scroll further down instead of re-sending the same ones.
+  async function harvestNewPosts(out, inspected, maxPosts, budget) {
+    if (budget <= 0) return 0;
+    var posts = findPosts(document.body);
+    var looked = 0;
+    for (var i = 0; i < posts.length && out.length < maxPosts && looked < budget; i++) {
+      var el = posts[i];
+      if (inspected.has(el)) continue;   // already inspected in this scan
+      inspected.add(el);
+      if (isAboveViewport(el)) continue; // behind the cursor — not our business anymore
+      looked++;
+      try {
+        await clickSeeMore(el);
+        var pd = extractPostData(el);
+        if (!pd.text && pd.images.length === 0 && !pd.link) continue;
+        var key = contentKey(pd);
+        if (key && seenKeys.has(key)) continue;   // already handled — don't re-download/re-send
+        if (pd.images.length > 0) pd.imagesBase64 = await downloadImagesAsBase64(pd.images); else pd.imagesBase64 = [];
+        if (key) seenKeys.add(key);
+        out.push(pd);
+        log("New post " + out.length + ": " + (pd.text || "").substring(0, 40).replace(/\n/g, " "));
+      } catch (e) { log("Post inspect failed: " + e.message); }
+    }
+    return looked;
   }
 
   // ------------------------------------------------------------------
@@ -600,5 +704,5 @@
     return "";
   }
 
-  log("FB Post Copier v9.1 loaded (incremental scan + post verification)");
+  log("FB Post Copier v9.3 loaded (persistent scan cursor + post verification)");
 })();

@@ -70,6 +70,11 @@ DEFAULT_SETTINGS = {
     "source_group_url": "https://www.facebook.com/groups/1144780033953810",
     "target_group_url": "https://www.facebook.com/groups/1770877160904592",
     "scan_interval_seconds": "60",
+    # Adaptive scanning ceiling: while scans keep finding nothing the interval is
+    # stretched (×1.5 per quiet cycle) up to this many seconds, and it snaps back to
+    # scan_interval_seconds as soon as a scan finds new posts. 0 (or <= the base
+    # interval) disables the backoff entirely.
+    "scan_interval_max_seconds": "900",
     "max_posts_per_day": "20",
     "cooldown_seconds": "10",
     "batch_size": "3",
@@ -97,6 +102,11 @@ DEFAULT_SETTINGS = {
     "notify_webhook_url": "",
     "notify_knock_api_key": "",
 }
+
+# Adaptive scan cadence (see adaptive_scan_interval).
+MIN_SCAN_INTERVAL_SECONDS = 10      # hard floor so a bad setting cannot hammer Facebook
+SCAN_BACKOFF_FACTOR = 1.5           # interval multiplier per quiet cycle
+SCAN_QUIET_CYCLES_BEFORE_BACKOFF = 2  # re-check at the base interval this many times first
 
 # ---------------------------------------------------------------------------
 # Database
@@ -502,6 +512,38 @@ def humanize(seconds: float, ratio: float = 0.25) -> float:
     return max(1.0, seconds * (1.0 + random.uniform(-ratio, ratio)))
 
 
+def adaptive_scan_interval(
+    settings: dict, current: int, quiet_cycles: int, new_count: int
+) -> tuple[int, int]:
+    """Pick the next scan interval for the source group, plus its quiet-cycle streak.
+
+    A group that keeps producing nothing does not need to be re-read every minute, and
+    a group that just produced a batch usually has more coming. So:
+
+    * a scan that stored posts → back to the base interval immediately (quiet streak 0)
+    * the first SCAN_QUIET_CYCLES_BEFORE_BACKOFF empty scans → still the base interval
+    * after that → ×SCAN_BACKOFF_FACTOR per empty scan, capped by
+      scan_interval_max_seconds
+
+    ``scan_interval_max_seconds`` of 0, or lower than the base interval, disables the
+    backoff (the cadence then stays at the base interval). Never returns less than
+    MIN_SCAN_INTERVAL_SECONDS.
+    """
+    base = max(MIN_SCAN_INTERVAL_SECONDS, int_setting(settings, "scan_interval_seconds", 60))
+    ceiling = int_setting(settings, "scan_interval_max_seconds", 900)
+    ceiling = max(base, ceiling)   # a ceiling below the base means "no backoff"
+
+    if new_count > 0:
+        return base, 0
+
+    quiet_cycles += 1
+    if quiet_cycles < SCAN_QUIET_CYCLES_BEFORE_BACKOFF or ceiling <= base:
+        return max(base, min(current or base, ceiling)), quiet_cycles
+
+    stretched = int(round(max(base, current or base) * SCAN_BACKOFF_FACTOR))
+    return min(ceiling, max(base, stretched)), quiet_cycles
+
+
 def within_active_hours(settings: dict) -> bool:
     """Posting window in local time; start == end (or 0/0) disables the check."""
     start = int_setting(settings, "active_hours_start", 0) % 24
@@ -564,6 +606,10 @@ class ServerState:
         self.last_scan_at: int | None = None
         self.last_post_at: int | None = None
         self.last_error: str = ""
+        # --- adaptive scan cadence (see adaptive_scan_interval) ---
+        self.scan_interval_current: int = 0   # 0 = not started yet
+        self.scan_quiet_cycles: int = 0       # consecutive scans that found nothing
+        self.last_scan_new_count: int = 0     # new posts stored by the last scan
 
     @property
     def connected(self) -> bool:
@@ -588,6 +634,9 @@ def build_stats() -> dict:
         "posted_today": count_posted_today(),
         "last_scan_at": state.last_scan_at,
         "last_post_at": state.last_post_at,
+        "scan_interval_seconds": int_setting(settings, "scan_interval_seconds", 60),
+        "scan_interval_current": state.scan_interval_current or int_setting(settings, "scan_interval_seconds", 60),
+        "scan_quiet_cycles": state.scan_quiet_cycles,
         "last_error": state.last_error,
         "started_at": state.started_at,
         "uptime_seconds": int(time.time()) - state.started_at,
@@ -897,6 +946,7 @@ async def handle_posts_found(msg: dict) -> None:
     err = msg.get("error") or ""
     state.last_scan_at = int(time.time())
     state.last_error = err
+    state.last_scan_new_count = new_count
     dup_note = f", {text_dupes} text-duplicate(s) skipped" if text_dupes else ""
     print(
         f"[server] posts_found: {len(posts)} received, {new_count} new{dup_note}"
@@ -1035,23 +1085,41 @@ async def auto_scan_loop() -> None:
                 continue
 
             settings = get_all_settings()
-            interval = max(10, int_setting(settings, "scan_interval_seconds", 60))
-            print(f"[server] auto-scan: scanning source group (interval={interval}s)")
-            await run_scan_once()
+            base = max(MIN_SCAN_INTERVAL_SECONDS, int_setting(settings, "scan_interval_seconds", 60))
+            interval = state.scan_interval_current or base
+            quiet = f", {state.scan_quiet_cycles} quiet cycle(s)" if state.scan_quiet_cycles else ""
+            print(f"[server] auto-scan: scanning source group (interval={interval}s{quiet})")
+
+            state.last_scan_new_count = 0
+            answered = await run_scan_once()
+            new_count = state.last_scan_new_count if answered else 0
+            # Adapt to the group: slow down while it stays quiet, snap back to the base
+            # interval as soon as a scan finds new posts (a batch usually means more).
+            state.scan_interval_current, state.scan_quiet_cycles = adaptive_scan_interval(
+                settings, interval, state.scan_quiet_cycles, new_count
+            )
             if not state.auto_mode:
                 break
+
             # Post new rows found by this scan (plus any backlog from earlier).
             await process_backlog("scan")
             if not state.auto_mode:
                 break
             st = build_stats()
+            cadence = f"next_scan~{state.scan_interval_current}s"
+            if state.scan_quiet_cycles and state.scan_interval_current > base:
+                cadence += f" (idle backoff, base {base}s)"
             print(
                 f"[server] status: posted_today={st['posted_today']} total={st['posts_total']} "
                 f"posted={st['posted_total']} failed={st['failed_total']} "
-                f"queue={st['new_queue']} next_scan~{interval}s"
+                f"queue={st['new_queue']} {cadence}"
             )
-            delay = humanize(interval, 0.2) if str(settings.get("humanize_timing", "true")).lower() != "false" else interval
-            await asyncio.sleep(delay)
+            delay = (
+                humanize(state.scan_interval_current, 0.2)
+                if str(settings.get("humanize_timing", "true")).lower() != "false"
+                else state.scan_interval_current
+            )
+            await asyncio.sleep(max(0.0, delay))
     except asyncio.CancelledError:
         print("[server] auto-scan loop cancelled")
     except Exception as e:  # noqa: BLE001
@@ -1062,6 +1130,9 @@ async def start_auto_farm() -> None:
     if state.auto_mode and state.scan_task and not state.scan_task.done():
         return
     state.auto_mode = True
+    # A fresh run starts fast: no inherited backoff from the previous session.
+    state.scan_interval_current = 0
+    state.scan_quiet_cycles = 0
     state.scan_task = asyncio.create_task(auto_scan_loop())
     print("[server] auto farm STARTED")
 
@@ -1075,6 +1146,12 @@ async def stop_auto_farm() -> None:
         except asyncio.CancelledError:
             pass
     state.scan_task = None
+    # No farm running means no cadence: drop the adaptive state so a stopped worker
+    # reports the base interval (and the next run starts fast instead of inheriting a
+    # backoff from a group that was quiet hours ago).
+    state.scan_interval_current = 0
+    state.scan_quiet_cycles = 0
+    state.last_scan_new_count = 0
     print("[server] auto farm STOPPED")
 
 
@@ -1241,7 +1318,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="row">
       <span class="status"><span id="conn-dot" class="dot gray"></span><span id="conn-text">checking…</span></span>
     </div>
-    <div class="meta">Posts total: <span id="posts-total">0</span> &middot; Posted today: <span id="posted-today">0</span> &middot; Queue: <span id="queue-count">0</span> &middot; Failed: <span id="failed-count">0</span> &middot; Activity: <span id="activity">idle</span></div>
+    <div class="meta">Posts total: <span id="posts-total">0</span> &middot; Posted today: <span id="posted-today">0</span> &middot; Queue: <span id="queue-count">0</span> &middot; Failed: <span id="failed-count">0</span> &middot; Activity: <span id="activity">idle</span> &middot; Scan: <span id="scan-cadence">-</span></div>
   </div>
 
   <div class="card">
@@ -1262,7 +1339,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="form-grid">
       <div><label>Source Group URL</label><input id="source_group_url" placeholder="https://www.facebook.com/groups/..."></div>
       <div><label>Target Group URL</label><input id="target_group_url" placeholder="https://www.facebook.com/groups/..."></div>
-      <div><label>Scan Interval (seconds)</label><input id="scan_interval_seconds" type="number" min="5"></div>
+      <div><label>Scan Interval (seconds, min 60)</label><input id="scan_interval_seconds" type="number" min="60"><div class="meta">The extension never scans the feed faster than this — Facebook's feed does not change every few seconds, and scanning too often just re-reads the same posts. Hard floor: 60 s.</div></div>
+      <div><label>Max Scan Interval (seconds — idle backoff)</label><input id="scan_interval_max_seconds" type="number" min="0"><div class="meta">While scan after scan finds nothing, the worker slows down (×1.5 per cycle) up to this value and snaps straight back to the base interval as soon as new posts appear. 0 turns the backoff off.</div></div>
       <div><label>Max Posts / 24h</label><input id="max_posts_per_day" type="number" min="0"></div>
       <div><label>Cooldown (seconds)</label><input id="cooldown_seconds" type="number" min="0"></div>
       <div><label>Batch Size</label><input id="batch_size" type="number" min="1"></div>
@@ -1350,6 +1428,14 @@ async function loadStatus() {
     document.getElementById('queue-count').textContent = s.new_queue || 0;
     document.getElementById('failed-count').textContent = s.failed_total || 0;
     document.getElementById('activity').textContent = s.posting ? 'posting…' : (s.scan_busy ? 'scanning…' : 'idle');
+    const cadence = document.getElementById('scan-cadence');
+    if (cadence) {
+      const base = s.scan_interval_seconds || 0;
+      const cur = s.scan_interval_current || base;
+      if (!s.auto_mode) cadence.textContent = 'stopped';
+      else if (cur > base) cadence.textContent = 'every ~' + cur + 's (idle backoff from ' + base + 's)';
+      else cadence.textContent = 'every ~' + cur + 's';
+    }
     const autoDot = document.getElementById('auto-dot');
     const autoText = document.getElementById('auto-text');
     autoDot.className = 'dot ' + (s.auto_mode ? (s.connected ? 'green' : 'yellow') : 'gray');
@@ -1363,6 +1449,7 @@ async function loadSettings() {
     document.getElementById('source_group_url').value = s.source_group_url || '';
     document.getElementById('target_group_url').value = s.target_group_url || '';
     document.getElementById('scan_interval_seconds').value = s.scan_interval_seconds || 60;
+    document.getElementById('scan_interval_max_seconds').value = (s.scan_interval_max_seconds === undefined || s.scan_interval_max_seconds === '') ? 900 : s.scan_interval_max_seconds;
     document.getElementById('max_posts_per_day').value = s.max_posts_per_day || 20;
     document.getElementById('cooldown_seconds').value = s.cooldown_seconds || 10;
     document.getElementById('batch_size').value = s.batch_size || 3;
@@ -1411,7 +1498,8 @@ async function saveSettings() {
   const data = {
     source_group_url: document.getElementById('source_group_url').value,
     target_group_url: document.getElementById('target_group_url').value,
-    scan_interval_seconds: document.getElementById('scan_interval_seconds').value,
+    scan_interval_seconds: Math.max(60, parseInt(document.getElementById('scan_interval_seconds').value, 10) || 60),
+    scan_interval_max_seconds: Math.max(0, parseInt(document.getElementById('scan_interval_max_seconds').value, 10) || 0),
     max_posts_per_day: document.getElementById('max_posts_per_day').value,
     cooldown_seconds: document.getElementById('cooldown_seconds').value,
     batch_size: document.getElementById('batch_size').value,

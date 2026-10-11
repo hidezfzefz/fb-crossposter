@@ -12,6 +12,7 @@ This is the regression net for the parts that are easy to break silently:
   busy      a "manual Post All in progress" answer requeues instead of failing
   backup    settings + history survive an export → reset → import round trip
   notify    push events fire for queued/failed/posted and the mute toggles work
+  adaptive  the scan interval backs off on a quiet feed and snaps back on new posts
 
 It boots the backend in a throwaway data directory on free ports, drives it through
 the same HTTP API the dashboard uses, and runs the fake extension from
@@ -445,6 +446,50 @@ def scenario_backup(b: Backend, r: Report) -> None:
         r.check("garbage import rejected", e.code, 400)
 
 
+def scenario_adaptive(b: Backend, r: Report) -> None:
+    """The scan cadence follows the group: stretch while nothing appears, snap back on a
+    batch of new posts. The interval logic is a pure function, so this asserts the real
+    sequence the loop walks through instead of waiting out minutes of timing."""
+    import server as worker
+
+    def step(seconds: str, current: int, quiet: int, new: int, ceiling: str = "900"):
+        settings = {"scan_interval_seconds": seconds, "scan_interval_max_seconds": ceiling}
+        return worker.adaptive_scan_interval(settings, current, quiet, new)
+
+    # base 60s, ceiling 900s: two quiet cycles at base, then ×1.5 each quiet cycle.
+    r.check("a fresh run scans at the base interval", step("60", 0, 0, 5), (60, 0))
+    r.check("first quiet cycle: still at base", step("60", 60, 0, 0), (60, 1))
+    r.check("second quiet cycle: stretches to ×1.5", step("60", 60, 1, 0), (90, 2))
+    r.check("keeps stretching", step("60", 90, 2, 0), (135, 3))
+    r.check("…", step("60", 135, 3, 0), (202, 4))
+    r.check("…", step("60", 202, 4, 0), (303, 5))
+    r.check("…", step("60", 303, 5, 0), (454, 6))
+    r.check("…", step("60", 454, 6, 0), (681, 7))
+    r.check("capped at the ceiling", step("60", 681, 7, 0), (900, 8))
+    r.check("and stays there", step("60", 900, 8, 0), (900, 9))
+    r.check("one new post snaps it back to base", step("60", 900, 9, 1), (60, 0))
+    r.check("a batch snaps it back too", step("60", 305, 5, 7), (60, 0))
+    r.check("the base interval has a hard floor",
+            step("3", 0, 0, 0), (worker.MIN_SCAN_INTERVAL_SECONDS, 1))
+    r.check("0 disables the backoff", step("60", 60, 5, 0, ceiling="0"), (60, 6))
+    r.check("a ceiling below the base disables it too",
+            step("120", 120, 4, 0, ceiling="30"), (120, 5))
+    r.check("a big burst after a long lull is immediate", step("60", 900, 20, 3), (60, 0))
+
+    # The running worker exposes the cadence (dashboard, fbctl and the popup read it).
+    b.reset()
+    settings = b.api("/api/settings")
+    r.check("backoff ceiling is a settable value", settings.get("scan_interval_max_seconds"), "900")
+    stats = b.api("/api/stats")
+    r.check("stats expose the interval", stats.get("scan_interval_seconds"), 10)
+    r.check("stats expose the current cadence", stats.get("scan_interval_current"), 10)
+    r.check("stats expose the quiet streak", stats.get("scan_quiet_cycles"), 0)
+    b.api("/api/settings", method="POST", payload={"scan_interval_max_seconds": "450"})
+    r.check("ceiling is stored", b.api("/api/settings")["scan_interval_max_seconds"], "450")
+    # Restore the default so a later scenario (or a rerun) starts from a clean state.
+    b.api("/api/settings", method="POST", payload={"scan_interval_max_seconds": "900"})
+
+
 def scenario_notify(b: Backend, r: Report) -> None:
     """Push events fire for queued/failed/posted, and the mute toggles are honoured."""
     b.reset()
@@ -520,6 +565,7 @@ SCENARIOS = {
     "busy": scenario_busy,
     "backup": scenario_backup,
     "notify": scenario_notify,
+    "adaptive": scenario_adaptive,
 }
 
 

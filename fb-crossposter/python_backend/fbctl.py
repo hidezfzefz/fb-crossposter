@@ -90,6 +90,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  posts:      total={s.get('posts_total')}  posted={s.get('posted_total')}  "
           f"failed={s.get('failed_total')}  queue={s.get('new_queue')}")
     print(f"  today:      {s.get('posted_today')} posted (rolling 24h)")
+    cur = s.get("scan_interval_current") or s.get("scan_interval_seconds") or 0
+    base = s.get("scan_interval_seconds") or 0
+    quiet = s.get("scan_quiet_cycles") or 0
+    cadence = f"every {cur}s" if cur else "-"
+    if cur and base and cur > base:
+        cadence += f" (idle backoff from {base}s after {quiet} quiet cycle(s))"
+    print(f"  scanning:   {cadence}")
     print(f"  extras:     active_hours={s.get('active_hours')}  "
           f"jitter={'on' if s.get('humanize_timing') else 'off'}  "
           f"text_dedup={'on' if s.get('dedup_text_only') else 'off'}")

@@ -1,9 +1,13 @@
-// popup.js — FB Post Copier v9.2
+// popup.js — FB Post Copier v9.3
 (function () {
+  var MIN_SCAN_INTERVAL = 60;      // hard floor: Facebook's feed does not change every few seconds
+  var MAX_SCAN_INTERVAL = 86400;
   var defaults = {
     targetGroupUrl: "https://www.facebook.com/groups/1770877160904592",
     sourceGroupUrl: "https://www.facebook.com/groups/1144780033953810",
     wsUrl: "ws://localhost:8765",
+    minScanIntervalSeconds: MIN_SCAN_INTERVAL,
+    activateSourceTabOnScan: true,
   };
   var invCount = 0;
   var bgPosting = false;   // reported by the background (a posting run is active)
@@ -14,17 +18,25 @@
     document.getElementById("sourceUrl").value = s.sourceGroupUrl;
     document.getElementById("targetUrl").value = s.targetGroupUrl;
     document.getElementById("wsUrl").value = s.wsUrl || defaults.wsUrl;
+    document.getElementById("scanInterval").value = s.minScanIntervalSeconds || defaults.minScanIntervalSeconds;
+    document.getElementById("activateOnScan").checked = s.activateSourceTabOnScan !== false;
   });
   refreshInv(); refreshConn(); renderPostAllBtn();
 
   document.getElementById("save").addEventListener("click", function() {
+    var raw = parseInt(document.getElementById("scanInterval").value, 10);
+    var interval = Math.min(MAX_SCAN_INTERVAL, Math.max(MIN_SCAN_INTERVAL, raw || MIN_SCAN_INTERVAL));
+    var clamped = interval !== raw;
+    document.getElementById("scanInterval").value = interval;
     var s = {
       sourceGroupUrl: document.getElementById("sourceUrl").value.trim(),
       targetGroupUrl: document.getElementById("targetUrl").value.trim(),
       wsUrl: document.getElementById("wsUrl").value.trim() || defaults.wsUrl,
+      minScanIntervalSeconds: interval,
+      activateSourceTabOnScan: document.getElementById("activateOnScan").checked,
     };
     browser.runtime.sendMessage({ action: "save_settings", settings: s }).then(function(r) {
-      showStatus(r && r.ok ? "✅ Saved!" : "❌ Save failed");
+      showStatus(r && r.ok ? (clamped ? "✅ Saved (interval raised to " + interval + "s)" : "✅ Saved!") : "❌ Save failed");
     });
   });
 
@@ -98,6 +110,13 @@
           " • total " + (r.stats.posts_total || 0) +
           " • queue " + (r.stats.new_queue || 0) +
           " • failed " + (r.stats.failed_total || 0);
+        // Adaptive cadence: the farm slows down on a quiet feed and speeds back up
+        // as soon as posts appear, so show what it is doing right now.
+        var cadence = r.stats.scan_interval_current || 0;
+        if (cadence) {
+          var base = r.stats.scan_interval_seconds || 0;
+          statsEl.textContent += " • scan every " + cadence + "s" + (base && cadence > base ? " (idle backoff)" : "");
+        }
       } else {
         statsEl.textContent = "";
       }

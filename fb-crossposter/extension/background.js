@@ -1,6 +1,14 @@
-// background.js — FB Post Copier v9.2
+// background.js — FB Post Copier v9.3
 // Coordinator: manual Copy/Add buttons, inventory, and the bridge to the optional
 // Python backend (auto-farm + dashboard). Everything manual works WITHOUT Python.
+//
+// v9.3 — scanning works like a human browsing instead of a restart every cycle:
+//   * ONE dedicated source tab is kept open for the farm's lifetime (closing it
+//     throws away Facebook's loaded feed AND the scroll position)
+//   * that tab is made VISIBLE for the scan (Firefox throttles background tabs and
+//     Facebook's infinite scroll does not run in them), then the user's tab is restored
+//   * scans are rate limited: at least minScanIntervalSeconds (never below 60) apart,
+//     so a 7-second backend interval can no longer hammer the feed
 //
 // v9.1 — Post All hardening (the "posts one thing / posts twice" bugs):
 //   * posting is single-flight — two Post All runs can never overlap
@@ -23,11 +31,15 @@
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   var DEFAULT_WS_URL = "ws://localhost:8765";
+  var MIN_SCAN_GAP_SECONDS = 60;   // never scan the feed faster than this
+  var SCAN_GAP_MAX_WAIT_MS = 150000; // stay inside the backend's 180s scan timeout
   var ws = null;
   var connected = false;
   var connecting = false;
   var scanBusy = false;
   var pythonStats = null;   // counters pushed by the Python backend
+  var sourceTabId = null;   // the dedicated source-group tab (kept open on purpose)
+  var lastScanStartedAt = 0;
 
   var defaults = {
     targetGroupUrl: "https://www.facebook.com/groups/1770877160904592",
@@ -38,6 +50,10 @@
     batchSize: 3,
     wsUrl: "ws://localhost:8765",
     pythonAutoMode: false,
+    // Minimum gap between two source-feed scans (seconds, hard floor 60) and
+    // whether the source tab is shown while scanning.
+    minScanIntervalSeconds: 60,
+    activateSourceTabOnScan: true,
   };
 
   function getSettings() {
@@ -335,19 +351,57 @@
   // ============================================================
   // AUTO SCAN (Python backend drives this; also used by dashboard "Scan Now")
   // ============================================================
+  // The source tab is reused, never closed: Facebook keeps the loaded feed and the
+  // content script keeps its scroll cursor in that page. Recreating it every cycle
+  // is what made every scan restart from the newest posts.
   async function findOrCreateSourceTab(url) {
     var groupId = groupIdFromUrl(url);
+    if (sourceTabId !== null) {
+      try {
+        var known = await browser.tabs.get(sourceTabId);
+        if (known && (!groupId || (known.url && known.url.indexOf(groupId) !== -1))) return known;
+      } catch (e) { log("source tab is gone: " + e.message); }
+      sourceTabId = null;
+    }
+    // Adopt an already-open tab on the same group (the user may be browsing it).
     var tabs = await browser.tabs.query({});
     if (groupId) {
       for (var t of tabs) {
-        if (t.url && t.url.indexOf("facebook.com") !== -1 && t.url.indexOf(groupId) !== -1) return t;
+        if (t.url && t.url.indexOf("facebook.com") !== -1 && t.url.indexOf(groupId) !== -1) { sourceTabId = t.id; return t; }
       }
     }
     // No tab for this group: open a dedicated one instead of hijacking an unrelated tab.
     var tab = await browser.tabs.create({ url: url, active: false });
     await waitForTabLoaded(tab.id);
     await sleep(3000);
+    sourceTabId = tab.id;
     return tab;
+  }
+
+  // Firefox only runs Facebook's infinite scroll (and full-speed timers) in a tab that
+  // is actually visible, so the source tab is activated for the scan and the tab the
+  // user was on is restored afterwards.
+  async function activateSourceTab(sourceTab) {
+    try {
+      var active = await browser.tabs.query({ active: true, currentWindow: true });
+      var previous = (active && active[0]) || null;
+      if (!previous || previous.id === sourceTab.id) return null;
+      await browser.tabs.update(sourceTab.id, { active: true });
+      await sleep(800);   // give the page a moment to be treated as visible
+      return previous.id;
+    } catch (e) { log("could not activate the source tab: " + e.message); return null; }
+  }
+  // Only hand focus back if the source tab is still the one that has it: a posting run
+  // may have opened its own active target tab meanwhile, and stealing focus from a
+  // composer mid-typing is exactly how posts get mangled.
+  async function restoreTab(previousTabId, sourceTabIdToCheck) {
+    if (previousTabId === null) return;
+    try {
+      var active = await browser.tabs.query({ active: true, currentWindow: true });
+      if (!active || !active[0] || active[0].id !== sourceTabIdToCheck) return;
+      await browser.tabs.get(previousTabId);
+      await browser.tabs.update(previousTabId, { active: true });
+    } catch (e) { log("could not restore the previous tab: " + e.message); }
   }
 
   async function doScan() {
@@ -356,15 +410,38 @@
     try {
       var settings = await getSettings();
       if (!settings.sourceGroupUrl) return { ok: false, posts: [], error: "No source group URL configured" };
+
+      // Rate limit. Facebook's feed does not change every few seconds, so a scan
+      // requested too early is DELAYED (not dropped) until the minimum gap has
+      // passed — the backend still receives its posts_found answer.
+      var gapMs = Math.max(MIN_SCAN_GAP_SECONDS, parseInt(settings.minScanIntervalSeconds, 10) || MIN_SCAN_GAP_SECONDS) * 1000;
+      var waitMs = lastScanStartedAt ? gapMs - (Date.now() - lastScanStartedAt) : 0;
+      if (waitMs > 0) {
+        waitMs = Math.min(waitMs, SCAN_GAP_MAX_WAIT_MS);
+        log("Scan asked for too soon — waiting " + Math.round(waitMs / 1000) + "s (minimum gap " + Math.round(gapMs / 1000) + "s)");
+        await sleep(waitMs);
+      }
+      lastScanStartedAt = Date.now();
+
       var sourceTab = await findOrCreateSourceTab(settings.sourceGroupUrl);
       if (!sourceTab) return { ok: false, posts: [], error: "could not open the source group tab" };
-      var ready = await ensureContentScript(sourceTab.id);
-      if (!ready) return { ok: false, posts: [], error: "content script did not load in the source tab" };
-      var result = await withTimeout(
-        browser.tabs.sendMessage(sourceTab.id, { action: "auto_scan", maxPosts: settings.scanMaxPosts || 12 }),
-        240000, "auto_scan"
-      );
-      return result || { ok: false, posts: [], error: "No scan result" };
+      // Don't grab focus while a posting run is going on (see the throttle note above).
+      var mayActivate = settings.activateSourceTabOnScan !== false && postQueueDepth === 0 && !postAllRunning;
+      var restoreTabId = mayActivate ? await activateSourceTab(sourceTab) : null;
+      try {
+        var ready = await ensureContentScript(sourceTab.id);
+        if (!ready) return { ok: false, posts: [], error: "content script did not load in the source tab" };
+        var result = await withTimeout(
+          browser.tabs.sendMessage(sourceTab.id, { action: "auto_scan", maxPosts: settings.scanMaxPosts || 12 }),
+          240000, "auto_scan"
+        );
+        if (result && result.cursor) {
+          log("Scan cursor is now at " + Math.round(result.cursor.depthY) + "px" + (result.cursor.atBottom ? " (end of the feed — next cycle restarts from the top)" : ""));
+        }
+        return result || { ok: false, posts: [], error: "No scan result" };
+      } finally {
+        await restoreTab(restoreTabId, sourceTab.id);
+      }
     } catch (e) {
       return { ok: false, posts: [], error: e.message };
     } finally {
@@ -386,6 +463,9 @@
     if (s.batch_size) cur.batchSize = parseInt(s.batch_size, 10) || cur.batchSize;
     if (s.max_posts_per_day) cur.maxPostsPerDay = parseInt(s.max_posts_per_day, 10) || cur.maxPostsPerDay;
     if (s.cooldown_seconds) cur.minSecondsBetweenPosts = parseInt(s.cooldown_seconds, 10) || cur.minSecondsBetweenPosts;
+    // The dashboard's scan interval is also the extension's minimum scan gap.
+    var interval = parseInt(s.scan_interval_seconds, 10);
+    if (interval > 0) cur.minScanIntervalSeconds = Math.max(MIN_SCAN_GAP_SECONDS, interval);
     cur.pythonAutoMode = String(s.auto_mode || "false").toLowerCase() === "true";
     await saveSettings(cur);
   }
@@ -502,10 +582,9 @@
           try { if (ws) ws.close(); } catch (e) {}
         } else {
           // Keep the Python dashboard in sync with popup edits (if connected).
-          wsSend({
-            action: "settings_update",
-            settings: { source_group_url: merged.sourceGroupUrl, target_group_url: merged.targetGroupUrl },
-          });
+          var push = { source_group_url: merged.sourceGroupUrl, target_group_url: merged.targetGroupUrl };
+          if (merged.minScanIntervalSeconds) push.scan_interval_seconds = merged.minScanIntervalSeconds;
+          wsSend({ action: "settings_update", settings: push });
         }
         sendResponse({ ok: true });
       })();
@@ -536,5 +615,5 @@
 
   // Start connecting to Python (optional — manual mode works without it)
   connect();
-  log("FB Post Copier v9.2 loaded (manual mode works without Python)");
+  log("FB Post Copier v9.3 loaded (manual mode works without Python)");
 })();

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "FB Post Copier",
-  "version": "9.2",
+  "version": "9.3",
   "description": "Copy posts from one Facebook group to another. Auto-farm via optional Python backend.",
   "permissions": ["activeTab", "tabs", "storage", "unlimitedStorage", "notifications", "<all_urls>"],
   "browser_action": { "default_popup": "popup.html", "default_title": "FB Post Copier" },

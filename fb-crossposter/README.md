@@ -11,6 +11,7 @@ fb-crossposter/
 │   ├── background.js          coordinator: inventory, posting, backend bridge
 │   ├── content.js             runs on facebook.com: buttons + scan + composer
 │   ├── popup.html / popup.js  settings, inventory, backend URL + live counters
+│   ├── tests/test_scan_flow.js headless scan check: runs content.js on a fake feed
 │   └── styles.css
 ├── python_backend/            ← the automation worker
 │   ├── server.py              WebSocket worker + SQLite + dashboard + backup API
@@ -34,6 +35,14 @@ fb-crossposter/
    (3 clicks). Permanent install needs signing via addons.mozilla.org.
 3. Recommended `about:config` settings (background tab throttling):
 
+`fb-post-copier.xpi` is simply `extension/` zipped with `manifest.json` at the
+archive root, so rebuild it after editing the extension:
+
+```bash
+cd extension && zip -X ../fb-post-copier.xpi \
+  manifest.json background.js content.js popup.html popup.js styles.css
+```
+
 | Setting | Value |
 |---|---|
 | `dom.min_background_timeout_value` | `0` |
@@ -41,6 +50,12 @@ fb-crossposter/
 | `dom.background_timeout_throttling` | `false` |
 | `dom.suspend_inactive.enabled` | `false` |
 | `browser.tabs.unloadOnLowMemory` | `false` |
+
+The farm keeps one dedicated tab open on the **source group** and briefly makes it
+the visible tab while scanning (Firefox throttles background tabs and Facebook's
+infinite scroll does not run in them), then restores the tab you were on. Turn that
+off in the popup (*Show the source tab while scanning*) if it bothers you — the
+scan will just be slower and may need the throttling values above to be set.
 
 ## 2. Run the automation worker
 
@@ -150,7 +165,7 @@ Environment variables (used by Docker, handy locally too):
 | Dashboard `http://localhost:5000` | settings, start/stop/scan, posts table, live counters |
 | `python3 fbctl.py status` | connection state, posted today/total, queue, failed, uptime — no browser needed |
 | `python3 fbctl.py settings max_posts_per_day=5` | change any setting from the terminal |
-| Extension popup | group URLs, inventory, backend URL, live counters (posted today / total / queue / failed) |
+| Extension popup | group URLs, minimum scan interval, inventory, backend URL, live counters (posted today / total / queue / failed) |
 | Push updates | the backend pushes settings + counters to the popup after every cycle — no polling needed |
 
 `fbctl` commands: `status`, `stats`, `posts [--limit N]`, `start`, `stop`,
@@ -164,10 +179,16 @@ Environment variables (used by Docker, handy locally too):
 ## 4. How the automation works
 
 ```
-every scan_interval seconds (with ±20% jitter)
+every scan_interval seconds (with ±20% jitter, stretched while the feed stays quiet
+— see "Idle backoff" below)
   1. worker -> extension: {action:"scan"}
-  2. extension re-anchors the source feed to the top, expands "See more",
-     extracts new posts (cursor-style: known posts are skipped), downloads images
+  2. extension shows the (permanently open, dedicated) source tab, then
+     a. sweeps the TOP of the feed — that is where brand-new posts appear
+     b. resumes at the depth the previous scan stopped and keeps scrolling DOWN
+        until it finds posts it has not seen, reaches the end of the feed, or
+        runs out of its per-scan scroll budget
+     every post is only sent once (seen-key cursor) and images are downloaded
+     only for new posts
   3. extension -> worker: {action:"posts_found", posts:[...]}
   4. worker dedups:
        a. SHA-256 content hash   (normalized text + first image URL)
@@ -183,6 +204,23 @@ every scan_interval seconds (with ±20% jitter)
 
 Guarantees:
 
+* **Progress, not restart** — one dedicated source tab stays open for the farm's
+  lifetime and the scan remembers where it stopped (per group, persisted). It does
+  not re-anchor to the top every cycle, so posts far down the feed are reached
+  instead of the same first posts being re-read forever. A cursor older than 6 h,
+  or one saved for another group, is discarded and the next scan starts at the top.
+* **Sane scan rate** — in addition to `scan_interval_seconds`, the extension refuses
+  to scan the feed more often than once per minute (a scan asked for earlier is
+  *delayed*, never dropped). 7 s between feed scans is pointless: the feed has not
+  changed and every cycle just re-reads the same posts.
+* **Idle backoff (adaptive intervals)** — the cadence follows the group instead of
+  being a constant. Two quiet scans in a row and the interval starts stretching
+  (×1.5 per quiet cycle) up to `scan_interval_max_seconds`; the moment a scan finds
+  new posts it snaps straight back to `scan_interval_seconds`, because a batch
+  usually means more is coming. Set `scan_interval_max_seconds` to `0` (or ≤ the base
+  interval) to switch the backoff off. The dashboard status line and `fbctl status`
+  always show the interval in force, e.g. `Scan: every ~20s (idle backoff from 10s)`,
+  and the popup appends `scan every 20s (idle backoff)` to its counters.
 * **Backlog drain** — posts found while stopped are queued and posted later.
 * **Single-flight** — posting never overlaps itself; manual *Post All* and the
   farm can't double-post each other (the farm gets a `busy` reply and retries
@@ -217,7 +255,8 @@ Docker and headless mode), never block the farm, and failures are logged as
 |---|---|---|
 | source_group_url | (yours) | group to read from |
 | target_group_url | (yours) | group to post to |
-| scan_interval_seconds | 60 | pause between scan cycles (min 10) |
+| scan_interval_seconds | 60 | pause between scan cycles; the extension never scans more often than once per minute (hard floor 60 s) |
+| scan_interval_max_seconds | 900 | idle-backoff ceiling: while scans keep finding nothing the interval stretches ×1.5 per quiet cycle up to this value, and snaps back to the base interval on the next new post. `0` disables the backoff |
 | batch_size | 3 | max posts per cycle |
 | cooldown_seconds | 10 | pause between two posts |
 | max_posts_per_day | 20 | rolling 24 h posting cap |
@@ -315,13 +354,33 @@ trip, plus a rejected garbage file) and `notify` (queued/failed/posted events
 reach a mock receiver in order, and the mute toggles hold). Exit code 0 means
 every assertion passed, so it is safe to wire into any pipeline.
 
+### The extension-side scan, without a browser
+
+The scan is the one part the Python suite cannot reach, so it has its own harness:
+it runs the real `content.js` in a stubbed page whose fake group feed grows by a
+page of posts once you scroll near the bottom (exactly like Facebook's infinite
+scroll) and asserts that a fresh scan reads the newest posts, that later scans
+resume at the saved depth and crawl wider each cycle, and that walking a 40-post
+feed returns all 40 posts, in order, exactly once:
+
+```bash
+node extension/tests/test_scan_flow.js     # ~1 s, exit code 0 = all 29 checks passed
+node extension/tests/test_scan_tabs.js     # ~1 s, exit code 0 = all 20 checks passed
+```
+
+`test_scan_tabs.js` covers the other half of the fix: it drives the real
+`background.js` against stubbed `browser.tabs`/WebSocket objects and asserts that the
+source tab is opened once and then reused (never recreated), that it is shown only for
+the scan and the tab you were on is restored, and that a scan requested inside the
+60 s floor is delayed rather than run immediately (or dropped).
+
 ## 8. Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and PR:
 
 | Job | What it proves |
 |---|---|
-| **Syntax checks** | every Python module compiles, every extension script parses, `manifest.json` + `docker-compose.yml` are valid |
+| **Syntax checks** | every Python module compiles, every extension script parses, the scan cursor harness passes, `manifest.json` + `docker-compose.yml` are valid |
 | **Scenario suite** (Ubuntu **and** Windows) | the regression suite above passes on both platforms — the “runs anywhere” claim is checked, not assumed |
 | **Docker** | the image builds, a real `docker run` serves `/api/status`, `fbctl` works inside the container, and the suite passes in there too |
 
@@ -335,7 +394,8 @@ level if you keep the app inside a parent directory).
 |---|---|
 | Popup: backend not connected | Worker not running, wrong WebSocket URL (popup field), or port not mapped (Docker: `-p 8766:8765`, so the popup needs `ws://localhost:8766`). |
 | Dashboard unreachable | Plain Python binds `127.0.0.1` by default — use `FB_COPIER_HTTP_HOST=0.0.0.0` (Docker does this automatically). |
-| Scan finds nothing | Source tab must be logged in and able to scroll; try Scan Now / `fbctl scan`. |
+| Scan finds nothing | Source tab must be logged in and able to scroll; try Scan Now / `fbctl scan`. If the source tab keeps being closed, the farm cannot make progress — leave it open (the extension reuses it on purpose). |
+| Scan keeps reporting the same posts / "0 new posts found" every cycle | Fixed in v9.3: the scan keeps one source tab open and resumes at the depth it stopped at instead of re-anchoring to the top. Check the log line `Scan cursor is now at …px` — it must grow between cycles; it resets to the top after the feed end, on a source-group change, and after **Reset dedup**. Also make sure the source tab is allowed to be visible (`Show the source tab while scanning` in the popup) and, if Firefox is minimised, that the `about:config` throttling values from §1 are set. |
 | Posts queued but not posted | Check `active_hours`, the daily cap (`fbctl status` shows queue + today), and the cooldown. |
 | Post All stops after one post | Fixed in v9.1 (30 s-per-tab stall). The popup result line shows the first error. |
 | Post All posted something twice | Only possible if you retried an item marked ⚠ (status unknown). Verify on Facebook first; v9.1 blocks overlapping runs and duplicate content keys. |
