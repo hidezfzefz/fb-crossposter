@@ -221,6 +221,14 @@ Guarantees:
   interval) to switch the backoff off. The dashboard status line and `fbctl status`
   always show the interval in force, e.g. `Scan: every ~20s (idle backoff from 10s)`,
   and the popup appends `scan every 20s (idle backoff)` to its counters.
+* **One cadence per group** — the cadence is remembered per source group (keyed by the
+  group id, so `/groups/123`, `/groups/123/` and a `/posts/456` permalink are the same
+  group). A busy group stays on the base interval while a quiet one backs off; switching
+  between them never hands one group's stretched interval to the other, and coming back
+  to a group resumes *its* cadence. A cadence older than 6 h is forgotten, and only the
+  10 most recent groups are kept. Changing the source group in the dashboard also pushes
+  the new setting to the extension and **scans the new group immediately** instead of
+  waiting out the old group's interval.
 * **Backlog drain** — posts found while stopped are queued and posted later.
 * **Single-flight** — posting never overlaps itself; manual *Post All* and the
   farm can't double-post each other (the farm gets a `busy` reply and retries

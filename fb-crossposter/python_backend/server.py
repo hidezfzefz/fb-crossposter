@@ -107,6 +107,8 @@ DEFAULT_SETTINGS = {
 MIN_SCAN_INTERVAL_SECONDS = 10      # hard floor so a bad setting cannot hammer Facebook
 SCAN_BACKOFF_FACTOR = 1.5           # interval multiplier per quiet cycle
 SCAN_QUIET_CYCLES_BEFORE_BACKOFF = 2  # re-check at the base interval this many times first
+SCAN_CADENCE_MAX_AGE_SECONDS = 6 * 60 * 60  # forget a group's cadence after this long
+MAX_TRACKED_SCAN_GROUPS = 10        # remembered cadences (most recent win)
 
 # ---------------------------------------------------------------------------
 # Database
@@ -544,6 +546,70 @@ def adaptive_scan_interval(
     return min(ceiling, max(base, stretched)), quiet_cycles
 
 
+# ---------------------------------------------------------------------------
+# Per-group scan cadence
+# ---------------------------------------------------------------------------
+def scan_group_key(url: str | None) -> str:
+    """Stable identifier for the group a cadence belongs to.
+
+    The group id is enough (and survives trailing slashes, query strings and
+    /posts/123 style links), so ``.../groups/123``, ``.../groups/123/`` and
+    ``.../groups/123/posts/456`` are all the same group.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"/groups/([^/?#]+)", text)
+    if m:
+        return m.group(1)
+    return text.rstrip("/")
+
+
+def cadence_for(group_key: str) -> tuple[int, int]:
+    """Remembered (interval, quiet streak) for a group, or (0, 0) if there is none."""
+    entry = state.scan_cadence.get(group_key)
+    if not entry:
+        return 0, 0
+    if int(time.time()) - int(entry.get("updated_at", 0)) > SCAN_CADENCE_MAX_AGE_SECONDS:
+        # Too old to be meaningful: a fresh visit starts at the base interval again.
+        state.scan_cadence.pop(group_key, None)
+        return 0, 0
+    return int(entry.get("interval") or 0), int(entry.get("quiet_cycles") or 0)
+
+
+def remember_cadence(group_key: str, interval: int, quiet_cycles: int) -> None:
+    """Store this group's cadence so it keeps its own rhythm across switches/restarts."""
+    state.scan_cadence[group_key] = {
+        "interval": int(interval),
+        "quiet_cycles": int(quiet_cycles),
+        "updated_at": int(time.time()),
+    }
+    if len(state.scan_cadence) > MAX_TRACKED_SCAN_GROUPS:
+        oldest = sorted(state.scan_cadence.items(), key=lambda kv: kv[1].get("updated_at", 0))
+        for key, _ in oldest[: len(state.scan_cadence) - MAX_TRACKED_SCAN_GROUPS]:
+            state.scan_cadence.pop(key, None)
+
+
+def group_scan_state(settings: dict) -> tuple[str, int, int]:
+    """(group key, interval, quiet streak) the next scan of the configured group uses."""
+    key = scan_group_key(settings.get("source_group_url"))
+    interval, quiet = cadence_for(key)
+    base = max(MIN_SCAN_INTERVAL_SECONDS, int_setting(settings, "scan_interval_seconds", 60))
+    return key, (interval or base), quiet
+
+
+async def wake_scan_loop() -> None:
+    """Interrupt the scan loop's sleep (runs on the asyncio loop, never a Flask thread)."""
+    state.scan_wake.set()
+
+
+async def sync_settings_to_extension() -> None:
+    """Push the current settings to the extension, if one is connected."""
+    if state.extension_ws is None:
+        return
+    await send_settings()
+
+
 def within_active_hours(settings: dict) -> bool:
     """Posting window in local time; start == end (or 0/0) disables the check."""
     start = int_setting(settings, "active_hours_start", 0) % 24
@@ -610,6 +676,12 @@ class ServerState:
         self.scan_interval_current: int = 0   # 0 = not started yet
         self.scan_quiet_cycles: int = 0       # consecutive scans that found nothing
         self.last_scan_new_count: int = 0     # new posts stored by the last scan
+        self.scan_group: str = ""             # group the active cadence belongs to
+        # Per-group cadences: switching the source group must not hand a quiet group's
+        # stretched interval to a brand-new one (and coming back resumes where it was).
+        self.scan_cadence: dict[str, dict] = {}   # group key -> {interval, quiet_cycles, updated_at}
+        # Set to interrupt the scan loop's sleep so a change takes effect at once.
+        self.scan_wake: asyncio.Event = asyncio.Event()
 
     @property
     def connected(self) -> bool:
@@ -625,6 +697,9 @@ def build_stats() -> dict:
     return {
         "connected": state.connected,
         "auto_mode": state.auto_mode,
+        "scan_group": state.scan_group or scan_group_key(settings.get("source_group_url")),
+        "scan_groups_tracked": len(state.scan_cadence),
+        "scan_groups": sorted(state.scan_cadence),   # groups with a remembered cadence
         "posting": state.posting,
         "scan_busy": state.scan_busy,
         "posts_total": count_posts(),
@@ -712,7 +787,16 @@ def api_settings_get():
 @app.route("/api/settings", methods=["POST"])
 def api_settings_set():
     data = request.get_json(force=True, silent=True) or {}
+    before = scan_group_key(get_all_settings().get("source_group_url"))
     update_settings(data)
+    after = scan_group_key(get_all_settings().get("source_group_url"))
+    # Push the new values to the extension (a dashboard-side source/target group change
+    # must reach the browser, not just the database) and, when the group actually
+    # changed, wake the scan loop so the new group is scanned right away.
+    _run_coro(sync_settings_to_extension())
+    if before != after:
+        print(f"[server] source group changed: {before or '-'} -> {after or '-'}")
+        _run_coro(wake_scan_loop())
     return jsonify({"ok": True, "settings": get_all_settings()})
 
 
@@ -764,6 +848,7 @@ def api_import():
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "invalid JSON body"}), 400
     mode = request.args.get("mode", "replace")
+    before = scan_group_key(get_all_settings().get("source_group_url"))
     try:
         result = import_state(data, mode=mode)
     except ValueError as e:
@@ -771,6 +856,9 @@ def api_import():
     # If the extension is connected, let it refresh its counters/dedup view.
     _run_coro(send_settings())
     _run_coro(push_stats())
+    # A restored backup may point at another group: scan it at once, with its cadence.
+    if scan_group_key(get_all_settings().get("source_group_url")) != before:
+        _run_coro(wake_scan_loop())
     return jsonify(result)
 
 
@@ -1086,8 +1174,18 @@ async def auto_scan_loop() -> None:
 
             settings = get_all_settings()
             base = max(MIN_SCAN_INTERVAL_SECONDS, int_setting(settings, "scan_interval_seconds", 60))
-            interval = state.scan_interval_current or base
-            quiet = f", {state.scan_quiet_cycles} quiet cycle(s)" if state.scan_quiet_cycles else ""
+            # Each source group keeps its own cadence: a group nobody switched to for a
+            # while comes back where it left off, a new one starts at the base interval.
+            group, interval, quiet_cycles = group_scan_state(settings)
+            if group != state.scan_group:
+                print(
+                    f"[server] scan cadence now follows group {group or '(none)'} "
+                    f"(interval={interval}s, {quiet_cycles} quiet cycle(s))"
+                )
+                state.scan_group = group
+            state.scan_interval_current = interval
+            state.scan_quiet_cycles = quiet_cycles
+            quiet = f", {quiet_cycles} quiet cycle(s)" if quiet_cycles else ""
             print(f"[server] auto-scan: scanning source group (interval={interval}s{quiet})")
 
             state.last_scan_new_count = 0
@@ -1096,8 +1194,9 @@ async def auto_scan_loop() -> None:
             # Adapt to the group: slow down while it stays quiet, snap back to the base
             # interval as soon as a scan finds new posts (a batch usually means more).
             state.scan_interval_current, state.scan_quiet_cycles = adaptive_scan_interval(
-                settings, interval, state.scan_quiet_cycles, new_count
+                settings, interval, quiet_cycles, new_count
             )
+            remember_cadence(group, state.scan_interval_current, state.scan_quiet_cycles)
             if not state.auto_mode:
                 break
 
@@ -1119,7 +1218,15 @@ async def auto_scan_loop() -> None:
                 if str(settings.get("humanize_timing", "true")).lower() != "false"
                 else state.scan_interval_current
             )
-            await asyncio.sleep(max(0.0, delay))
+            # Interruptible: changing the source group wakes this immediately so the new
+            # group is scanned at once instead of after the old group's (maybe 15 minute)
+            # interval has elapsed.
+            try:
+                await asyncio.wait_for(state.scan_wake.wait(), timeout=max(0.5, delay))
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                state.scan_wake.clear()
     except asyncio.CancelledError:
         print("[server] auto-scan loop cancelled")
     except Exception as e:  # noqa: BLE001
@@ -1130,9 +1237,13 @@ async def start_auto_farm() -> None:
     if state.auto_mode and state.scan_task and not state.scan_task.done():
         return
     state.auto_mode = True
-    # A fresh run starts fast: no inherited backoff from the previous session.
+    # The first scan happens immediately anyway; clear only the *active* view so a
+    # stopped/just-started worker reports the base interval. Remembered per-group
+    # cadences survive, so each group still resumes its own rhythm.
     state.scan_interval_current = 0
     state.scan_quiet_cycles = 0
+    state.scan_group = ""
+    state.scan_wake.clear()
     state.scan_task = asyncio.create_task(auto_scan_loop())
     print("[server] auto farm STARTED")
 
@@ -1146,12 +1257,14 @@ async def stop_auto_farm() -> None:
         except asyncio.CancelledError:
             pass
     state.scan_task = None
-    # No farm running means no cadence: drop the adaptive state so a stopped worker
-    # reports the base interval (and the next run starts fast instead of inheriting a
-    # backoff from a group that was quiet hours ago).
+    # No farm running means no active cadence: a stopped worker reports the base
+    # interval. Per-group cadences are kept on purpose — restarting the farm should
+    # not forget that group A is slow and group B is busy.
     state.scan_interval_current = 0
     state.scan_quiet_cycles = 0
+    state.scan_group = ""
     state.last_scan_new_count = 0
+    state.scan_wake.clear()
     print("[server] auto farm STOPPED")
 
 
@@ -1208,8 +1321,12 @@ async def extension_handler(websocket, *args) -> None:
             elif action == "settings_update":
                 data = msg.get("settings")
                 if isinstance(data, dict):
+                    before = scan_group_key(get_all_settings().get("source_group_url"))
                     update_settings(data)
                     print(f"[server] settings updated from extension: {sorted(data)}")
+                    if scan_group_key(get_all_settings().get("source_group_url")) != before:
+                        print("[server] source group changed from the extension — rescanning now")
+                        await wake_scan_loop()
             elif action == "posts_found":
                 await handle_posts_found(msg)
             elif action == "post_result":

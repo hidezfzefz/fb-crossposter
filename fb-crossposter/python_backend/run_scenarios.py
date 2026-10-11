@@ -9,10 +9,10 @@ This is the regression net for the parts that are easy to break silently:
   textdup   the same text with a different image URL is skipped (30-day text dedup)
   backlog   posts found while the farm is stopped are queued, then posted when it starts
   fail      a failing post is recorded as failed, the rest still post
-  busy      a "manual Post All in progress" answer requeues instead of failing
-  backup    settings + history survive an export → reset → import round trip
+  busy      a "manual Post All in progress" answer requeues instead of failing  backup    settings + history survive an export → reset → import round trip
   notify    push events fire for queued/failed/posted and the mute toggles work
   adaptive  the scan interval backs off on a quiet feed and snaps back on new posts
+  groups    each source group keeps its own cadence, and switching scans the new group at once
 
 It boots the backend in a throwaway data directory on free ports, drives it through
 the same HTTP API the dashboard uses, and runs the fake extension from
@@ -243,6 +243,63 @@ class MockReceiver:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             self.proc.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Minimal live extension (for checks that need to watch the wire, not the outcome)
+# ---------------------------------------------------------------------------
+class WsClient:
+    """Records every message the worker sends, answering scans/do_posts like the real
+    extension does. Used to assert pushing settings and reacting to a group switch."""
+
+    def __init__(self, backend: Backend) -> None:
+        self.backend = backend
+        self.thread: threading.Thread | None = None
+        self.error: BaseException | None = None
+        self.messages: list[dict] = []
+        self.scans = 0
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        import websockets
+
+        async def client() -> None:
+            async with websockets.connect(self.backend.ws_url, max_size=None) as ws:
+                await ws.send(json.dumps({"action": "hello", "settings": {}}))
+                while not self._stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    msg = json.loads(raw)
+                    self.messages.append(msg)
+                    if msg.get("action") == "scan":
+                        self.scans += 1
+                        await ws.send(json.dumps({"action": "posts_found", "posts": []}))
+                    elif msg.get("action") == "do_post":
+                        await ws.send(json.dumps({"action": "post_result", "id": msg.get("id"),
+                                                  "success": True, "error": ""}))
+
+        try:
+            asyncio.run(client())
+        except BaseException as e:  # pragma: no cover - surfaced by stop()
+            self.error = e
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.thread:
+            self.thread.join(timeout=10)
+        if self.error:
+            raise RuntimeError(f"ws client crashed: {self.error!r}")
+
+    def settings_seen(self) -> list[dict]:
+        return [m.get("settings") or {} for m in self.messages if m.get("action") == "settings"]
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +547,105 @@ def scenario_adaptive(b: Backend, r: Report) -> None:
     b.api("/api/settings", method="POST", payload={"scan_interval_max_seconds": "900"})
 
 
+def scenario_groups(b: Backend, r: Report) -> None:
+    """Per-group scan cadence: switching source groups must not hand one group's
+    stretched interval to another, and the switch has to reach the extension at once."""
+    import server as worker
+
+    group_a = "https://www.facebook.com/groups/111111111111111"
+    group_b = "https://www.facebook.com/groups/222222222222222"
+    settings_a = {"source_group_url": group_a, "scan_interval_seconds": "60",
+                  "scan_interval_max_seconds": "900"}
+    settings_b = {"source_group_url": group_b, "scan_interval_seconds": "60",
+                  "scan_interval_max_seconds": "900"}
+
+    # --- group identity: every shape of the same group URL maps to one key
+    r.check("group key from a plain URL", worker.scan_group_key(group_a), "111111111111111")
+    r.check("trailing slash is the same group",
+            worker.scan_group_key(group_a + "/"), "111111111111111")
+    r.check("query string is the same group",
+            worker.scan_group_key(group_a + "?ref=share"), "111111111111111")
+    r.check("a post permalink is the same group",
+            worker.scan_group_key(group_a + "/posts/987654321"), "111111111111111")
+    r.check("another group is a different key",
+            worker.scan_group_key(group_b), "222222222222222")
+    r.check("no URL, no group", worker.scan_group_key(""), "")
+
+    # --- per-group memory (the same state the running loop uses)
+    state = worker.state
+    state.scan_cadence.clear()
+    r.check("a group seen for the first time starts at the base interval",
+            worker.group_scan_state(settings_a), ("111111111111111", 60, 0))
+    worker.remember_cadence("111111111111111", 900, 8)   # group A went quiet for a while
+    r.check("coming back to it resumes its own cadence",
+            worker.group_scan_state(settings_a), ("111111111111111", 900, 8))
+    r.check("switching to another group starts that one at its base interval",
+            worker.group_scan_state(settings_b), ("222222222222222", 60, 0))
+    r.check("and does not disturb the first group",
+            worker.group_scan_state(settings_a), ("111111111111111", 900, 8))
+    state.scan_cadence["111111111111111"]["updated_at"] -= worker.SCAN_CADENCE_MAX_AGE_SECONDS + 1
+    r.check("a cadence older than the memory window is forgotten",
+            worker.group_scan_state(settings_a), ("111111111111111", 60, 0))
+    for i in range(worker.MAX_TRACKED_SCAN_GROUPS + 3):
+        worker.remember_cadence(f"group-{i}", 90, 1)
+    r.check("only the most recent groups are remembered",
+            len(state.scan_cadence), worker.MAX_TRACKED_SCAN_GROUPS)
+    state.scan_cadence.clear()
+
+    # --- live: a dashboard-side group switch reaches the extension and is scanned now
+    b.reset()
+    b.api("/api/settings", method="POST", payload={
+        "source_group_url": group_a,
+        "scan_interval_seconds": "600",     # long on purpose: only the wake makes this fast
+        "scan_interval_max_seconds": "900",
+        "humanize_timing": "false",
+    })
+    client = WsClient(b)
+    client.start()
+    try:
+        b.wait_connected()
+        stats = b.api("/api/stats")
+        r.check("stats name the group the cadence belongs to", stats["scan_group"], "111111111111111")
+        r.check("the configured group's cadence is its base interval",
+                stats["scan_interval_current"], 600)
+
+        b.api("/api/start", method="POST")
+        deadline = time.time() + 20
+        while client.scans < 1 and time.time() < deadline:
+            time.sleep(0.2)
+        r.check("the farm scans the configured group", client.scans >= 1, True)
+
+        client.messages.clear()
+        scans_before = client.scans
+        started = time.time()
+        b.api("/api/settings", method="POST", payload={"source_group_url": group_b})
+        pushed = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            pushed = next((s for s in client.settings_seen()
+                           if s.get("source_group_url") == group_b), None)
+            if pushed and client.scans > scans_before:
+                break
+            time.sleep(0.2)
+        elapsed = time.time() - started
+
+        r.check("the extension was told about the new source group", bool(pushed), True)
+        r.check("the new group was scanned right away (no waiting out the old interval)",
+                client.scans > scans_before, True)
+        r.check("that happened in seconds, not one interval", elapsed < 10, True)
+        stats = b.api("/api/stats")
+        r.check("the active cadence moved to the new group", stats["scan_group"], "222222222222222")
+        r.check("the new group starts at the base interval, not the old group's",
+                stats["scan_interval_current"], 600)
+        # Order-independent: other scenarios may have left their own groups remembered.
+        tracked = stats.get("scan_groups") or []
+        r.check("both groups are remembered separately",
+                [g for g in ("111111111111111", "222222222222222") if g not in tracked], [])
+    finally:
+        b.api("/api/stop", method="POST")
+        client.stop()
+
+
 def scenario_notify(b: Backend, r: Report) -> None:
     """Push events fire for queued/failed/posted, and the mute toggles are honoured."""
     b.reset()
@@ -566,6 +722,7 @@ SCENARIOS = {
     "backup": scenario_backup,
     "notify": scenario_notify,
     "adaptive": scenario_adaptive,
+    "groups": scenario_groups,
 }
 
 

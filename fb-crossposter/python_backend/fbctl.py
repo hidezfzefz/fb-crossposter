@@ -96,6 +96,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     cadence = f"every {cur}s" if cur else "-"
     if cur and base and cur > base:
         cadence += f" (idle backoff from {base}s after {quiet} quiet cycle(s))"
+    # Only worth showing once more than one group's cadence is remembered.
+    if s.get("scan_group") and (s.get("scan_groups_tracked") or 0) > 1:
+        cadence += f"  [group {s['scan_group']}]"
     print(f"  scanning:   {cadence}")
     print(f"  extras:     active_hours={s.get('active_hours')}  "
           f"jitter={'on' if s.get('humanize_timing') else 'off'}  "
