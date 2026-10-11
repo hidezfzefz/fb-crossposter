@@ -17,7 +17,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY server.py notifier.py simulate_extension.py fbctl.py ./
+# The test/CLI helpers come along too, so the image is self-checking:
+#   docker compose exec fb-post-copier python run_scenarios.py
+#   docker compose exec fb-post-copier python fbctl.py status
+COPY server.py notifier.py simulate_extension.py fbctl.py \
+     run_scenarios.py mock_notify_receiver.py ./
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 

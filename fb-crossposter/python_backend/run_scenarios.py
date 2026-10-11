@@ -11,6 +11,7 @@ This is the regression net for the parts that are easy to break silently:
   fail      a failing post is recorded as failed, the rest still post
   busy      a "manual Post All in progress" answer requeues instead of failing
   backup    settings + history survive an export → reset → import round trip
+  notify    push events fire for queued/failed/posted and the mute toggles work
 
 It boots the backend in a throwaway data directory on free ports, drives it through
 the same HTTP API the dashboard uses, and runs the fake extension from
@@ -179,6 +180,68 @@ class Backend:
         stats = self.api("/api/stats")
         if stats.get("posts_total"):
             raise RuntimeError(f"reset left {stats['posts_total']} rows behind")
+
+
+# ---------------------------------------------------------------------------
+# Local notification receiver (reuses the project's mock_notify_receiver.py)
+# ---------------------------------------------------------------------------
+class MockReceiver:
+    def __init__(self, backend: Backend) -> None:
+        self.port = free_port()
+        self.log = os.path.join(backend.tmpdir, "notify.log")
+        self.proc: subprocess.Popen | None = None
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/hook"
+
+    def start(self) -> None:
+        open(self.log, "w").close()
+        self.proc = subprocess.Popen(
+            [sys.executable, "mock_notify_receiver.py", "--port", str(self.port), "--log", self.log],
+            cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                    print(f"[ci] mock notify receiver on 127.0.0.1:{self.port}")
+                    return
+            except OSError:
+                time.sleep(0.2)
+        raise RuntimeError("mock notify receiver did not start")
+
+    def events(self) -> list[dict]:
+        out: list[dict] = []
+        try:
+            with open(self.log, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        body = json.loads(record.get("body") or "{}")
+                    except json.JSONDecodeError:
+                        continue
+                    out.append({
+                        "event": body.get("event"),
+                        "path": record.get("path"),
+                        "body": body,
+                        "headers": record.get("headers") or {},
+                    })
+        except OSError:
+            pass
+        return out
+
+    def clear(self) -> None:
+        open(self.log, "w").close()
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +445,73 @@ def scenario_backup(b: Backend, r: Report) -> None:
         r.check("garbage import rejected", e.code, 400)
 
 
+def scenario_notify(b: Backend, r: Report) -> None:
+    """Push events fire for queued/failed/posted, and the mute toggles are honoured."""
+    b.reset()
+    recv = MockReceiver(b)
+    recv.start()
+    try:
+        b.api("/api/settings", method="POST", payload={
+            "notify_provider": "webhook",
+            "notify_webhook_url": recv.url,
+            "notify_on_posted": "true",
+            "notify_on_failed": "true",
+            "notify_on_queued": "true",
+        })
+
+        # 1) The dashboard/CLI test button sends one synchronous event.
+        result = b.api("/api/notify-test", method="POST")
+        r.check("test notification sent", result.get("ok"), True)
+        events = recv.events()
+        r.check("test event delivered", [e["event"] for e in events], ["test"])
+        r.check("body has Discord-style content", bool(events[0]["body"].get("content")) if events else None, True)
+        r.check("body has Slack-style text", bool(events[0]["body"].get("text")) if events else None, True)
+        r.check("posted to the configured path", events[0]["path"] if events else None, "/hook")
+
+        # 2) A real farm run: queued, failed and posted all reach the receiver.
+        recv.clear()
+        sim = Sim(b, "fail", linger=6.0, max_seconds=60.0, fail_first=1)
+        sim.start()
+        try:
+            b.wait_connected()
+            b.api("/api/start", method="POST")
+            b.wait_for("notify run", lambda s: s["failed_total"] >= 1 and s["posted_total"] >= 2)
+        finally:
+            sim.join(timeout=75)
+            b.api("/api/stop", method="POST")
+
+        names = [e["event"] for e in recv.events()]
+        r.check("queued event sent", names.count("queued") >= 1, True)
+        r.check("failed event sent", names.count("failed"), 1)
+        r.check("posted events sent", names.count("posted"), 2)
+        r.check("queued before failed before posted",
+                names.index("queued") < names.index("failed") < names.index("posted"), True)
+
+        # 3) Mute queued events; posted events must keep flowing.
+        b.reset()
+        b.api("/api/settings", method="POST", payload={
+            "notify_provider": "webhook",
+            "notify_webhook_url": recv.url,
+            "notify_on_queued": "false",
+        })
+        recv.clear()
+        sim = Sim(b, "backlog", linger=6.0, max_seconds=45.0)
+        sim.start()
+        try:
+            b.wait_connected()
+            b.api("/api/start", method="POST")
+            b.wait_for("muted notify run", lambda s: s["posted_total"] >= 1, timeout=60)
+        finally:
+            sim.join(timeout=60)
+            b.api("/api/stop", method="POST")
+
+        names = [e["event"] for e in recv.events()]
+        r.check("muted queued events suppressed", names.count("queued"), 0)
+        r.check("posted still delivered while muted", names.count("posted"), 1)
+    finally:
+        recv.stop()
+
+
 SCENARIOS = {
     "dedup": scenario_dedup,
     "textdup": scenario_textdup,
@@ -389,6 +519,7 @@ SCENARIOS = {
     "fail": scenario_fail,
     "busy": scenario_busy,
     "backup": scenario_backup,
+    "notify": scenario_notify,
 }
 
 

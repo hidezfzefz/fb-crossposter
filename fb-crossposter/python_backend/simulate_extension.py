@@ -202,6 +202,15 @@ async def run(args: argparse.Namespace) -> None:
                     )
                 )
 
+            elif action == "stats":
+                # The backend pushes counters for the popup; the real extension
+                # renders them, the simulator just shows the headline numbers.
+                st = msg.get("stats") or {}
+                print(
+                    f"[sim {now()}] <- stats (posted={st.get('posted_total')} "
+                    f"queue={st.get('new_queue')} failed={st.get('failed_total')})"
+                )
+
             elif action == "reset_dedup":
                 print(f"[sim {now()}] <- reset_dedup")
 

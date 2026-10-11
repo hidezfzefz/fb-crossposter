@@ -13,12 +13,16 @@ fb-crossposter/
 │   ├── popup.html / popup.js  settings, inventory, backend URL + live counters
 │   └── styles.css
 ├── python_backend/            ← the automation worker
-│   ├── server.py              WebSocket worker + SQLite + dashboard + stats
-│   ├── fbctl.py               terminal control (status/start/stop/scan/settings)
+│   ├── server.py              WebSocket worker + SQLite + dashboard + backup API
+│   ├── fbctl.py               terminal control (status/start/scan/settings/export/import)
+│   ├── notifier.py            push notifications (ntfy / Telegram / webhook / Knock)
 │   ├── simulate_extension.py  dry-run tool: fake extension, no Facebook needed
+│   ├── run_scenarios.py       regression suite: replays every scenario, asserts the result
+│   ├── mock_notify_receiver.py local receiver for testing notifications
 │   ├── Dockerfile             self-contained image (autostart, healthcheck)
 │   └── requirements.txt
 ├── docker-compose.yml         one-command deployment with persistence
+├── .github/workflows/ci.yml   syntax + scenario suite (Linux/Windows) + Docker build
 └── fb-post-copier.xpi         packaged extension
 ```
 
@@ -42,20 +46,76 @@ fb-crossposter/
 
 ### Option A — Docker (any PC, recommended for “set and forget”)
 
+Install Docker Desktop (Windows/macOS) or `docker-ce` + the compose plugin
+(Fedora), then from the folder that contains `docker-compose.yml`:
+
 ```bash
-docker compose up -d --build     # from the project root
+docker compose up -d --build     # first run builds the image, then starts it
 docker compose logs -f           # watch the automation
+```
+
+On Linux the `docker` CLI needs root — running every command with `sudo` works,
+but it's better to join the `docker` group once (log out/in afterwards, or use
+`newgrp docker`):
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+Otherwise you'll see `permission denied while trying to connect to the docker API
+at unix:///var/run/docker.sock` (the container will still have been created).
+
+The first build downloads `python:3.12-slim` and installs three dependencies
+(`websockets`, `flask`, `flask-cors`) — it needs network access and takes a
+minute or two. Later builds are cached. After any code change: `docker compose up -d --build`.
+
+No compose? The same thing with plain Docker:
+
+```bash
+docker build -t fb-post-copier ./python_backend
+docker run -d --name fb-post-copier --restart unless-stopped \
+  -p 8766:8765 -p 5000:5000 \
+  -v fb-copier-data:/app/data \
+  -e FB_COPIER_AUTOSTART=true \
+  fb-post-copier
+```
+
+Confirm it is actually running (the container reports `healthy` once
+`/api/status` answers):
+
+```bash
+docker ps                                          # fb-post-copier  Up 2 minutes (healthy)
+docker logs fb-post-copier | tail -5               # "[server] WebSocket server listening on ws://0.0.0.0:8765"
+curl -s http://localhost:5000/api/status           # {"connected": false, ...} until Firefox connects
+docker exec fb-post-copier python fbctl.py status  # same view from inside the container
+```
+
+**Check the `PORTS` column.** `docker ps` must show
+`0.0.0.0:5000->5000/tcp, 0.0.0.0:8766->8765/tcp`. If `PORTS` is empty the
+container is running but unreachable from your browser — that happens when a
+chosen host port is already taken: Docker then starts the container *without any*
+published ports, while the healthcheck (which runs inside the container) still
+reports `healthy`. Pick a free port and recreate:
+
+```bash
+FB_COPIER_WS_PUBLISH=9000 docker compose up -d   # extension URL becomes ws://localhost:9000
+docker compose down && docker compose up -d      # or just free the old port and re-up
 ```
 
 That's it: the worker restarts with the machine (`restart: unless-stopped`),
 auto-starts the farm (`FB_COPIER_AUTOSTART=true`), persists everything in the
 `fb-copier-data` volume, and exposes:
 
-* `ws://localhost:8765` — the extension connects here
+* `ws://localhost:8766` — **the extension connects here** (the popup's default is
+  `ws://localhost:8765`, so set it to the value `docker ps` shows on the left of
+  `->8765`; override with `FB_COPIER_WS_PUBLISH`)
 * `http://localhost:5000` — dashboard, and `docker compose exec fb-post-copier python fbctl.py status`
 
 Set `TZ: "Europe/Berlin"` (or yours) in `docker-compose.yml` if you use active
 hours. Remove `FB_COPIER_AUTOSTART` if you prefer to start the farm manually.
+The image is checked by CI on every push (build → run → `/api/status` → `fbctl`
+→ a scenario replay inside the container), so a broken Dockerfile fails the build
+rather than your evening.
 
 ### Option B — plain Python (Windows / Fedora)
 
@@ -71,9 +131,13 @@ Useful variants:
 
 ```bash
 python3 server.py --headless --autostart   # no dashboard at all, farm on connect
-python3 server.py --ws-port 9000           # custom ports
+python3 server.py --ws-port 9000           # custom ports (popup URL must match)
 python3 fbctl.py status                    # control from a terminal
 ```
+
+If port 8765 is already used by something else on your machine, the worker exits
+with `[Errno 98] Address already in use` — start it on another port
+(`--ws-port 9000`) and put the same URL in the extension popup.
 
 Environment variables (used by Docker, handy locally too):
 `FB_COPIER_WS_HOST`, `FB_COPIER_WS_PORT`, `FB_COPIER_HTTP_HOST`,
@@ -90,8 +154,9 @@ Environment variables (used by Docker, handy locally too):
 | Push updates | the backend pushes settings + counters to the popup after every cycle — no polling needed |
 
 `fbctl` commands: `status`, `stats`, `posts [--limit N]`, `start`, `stop`,
-`scan`, `reset`, `settings [KEY=VALUE …]`. Point it elsewhere with
-`--url http://host:5000` or `FB_COPIER_HTTP_URL`.
+`scan`, `reset`, `settings [KEY=VALUE …]`, `export [file]`, `import FILE [--merge]`,
+`notify-test`. Point it elsewhere with `--url http://host:5000` or
+`FB_COPIER_HTTP_URL`.
 
 > Headless mode intentionally has no HTTP API — use `start`/`stop`/`settings`
 > before going headless, or read the log (it prints a status line every cycle).
@@ -166,7 +231,50 @@ Docker and headless mode), never block the farm, and failures are logged as
 | notify_webhook_url | (empty) | Discord/Slack/generic webhook |
 | notify_telegram_chat_id | (empty) | Telegram chat id (token via `FB_COPIER_TELEGRAM_TOKEN`) |
 
-## 6. Test without Facebook (dry run)
+## 6. Backup — move settings + history between machines
+
+Everything lives in one JSON file, so switching PC (or recovering after a
+reinstall) is: export on the old machine, import on the new one. Included:
+**every setting** (group URLs, schedule, caps, notification config) and the
+**complete post history** — statuses, timestamps, errors, the dedup hashes and
+the normalized text, so the new machine never re-posts what the old one already
+posted.
+
+**Dashboard:** *Backup & Move* card → **⬇ Export backup** downloads
+`fb-copier-backup.json`; **⬆ Import backup** restores it (tick *merge* to keep
+whatever is already in the database, otherwise it replaces settings + history).
+
+**Terminal:**
+
+```bash
+python3 fbctl.py export backup.json          # from a running dashboard-mode worker
+python3 fbctl.py export backup.json --images # also embed pending images (bigger)
+python3 fbctl.py import backup.json          # replace settings + history
+python3 fbctl.py import backup.json --merge  # keep existing rows, skip duplicates
+```
+
+**Docker:**
+
+```bash
+docker exec fb-post-copier python fbctl.py export /app/data/backup.json
+docker cp fb-post-copier:/app/data/backup.json ./fb-copier-backup.json
+docker cp ./fb-copier-backup.json fb-post-copier:/app/data/backup.json
+docker exec fb-post-copier python fbctl.py import /app/data/backup.json
+```
+
+The file is plain JSON (`{"version": 1, "settings": {…}, "posts": […]}`, with
+base64 images only for posts that are still queued), so it is easy to inspect,
+diff or keep in a private repo. Imports ignore unknown settings keys, skip
+malformed rows instead of aborting, and are **idempotent**: importing the same
+file twice adds nothing (verified in CI).
+
+> **Treat the backup like a password file.** It is unencrypted and carries every
+> setting stored in the database, which can include an ntfy bearer token, a Knock
+> API key or a Telegram bot token if you saved one (env variables like
+> `FB_COPIER_TELEGRAM_TOKEN` are *not* in the file — re-set them on the new
+> machine). Delete the file from shared storage once the move is done.
+
+## 7. Test without Facebook (dry run)
 
 `simulate_extension.py` impersonates the extension:
 
@@ -187,21 +295,59 @@ python3 fbctl.py settings notify_provider=webhook notify_webhook_url=http://127.
 python3 fbctl.py notify-test
 ```
 
-## 7. Troubleshooting
+### The whole suite, automatically
+
+`run_scenarios.py` boots a throwaway worker on free ports, drives it through the
+same HTTP API the dashboard uses, and asserts the outcome of every scenario
+above:
+
+```bash
+cd python_backend
+python3 run_scenarios.py                  # ~2.5 min, prints ok/FAIL per check
+python3 run_scenarios.py dedup textdup    # just some of them
+```
+
+Covered: `dedup` (the same post twice → stored once), `textdup` (same text, new
+image URL → skipped), `backlog` (found while stopped → posted on start), `fail`
+(a failing post is recorded, the rest still post), `busy` (manual *Post All* in
+progress requeues instead of failing), `backup` (export → reset → import round
+trip, plus a rejected garbage file) and `notify` (queued/failed/posted events
+reach a mock receiver in order, and the mute toggles hold). Exit code 0 means
+every assertion passed, so it is safe to wire into any pipeline.
+
+## 8. Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and PR:
+
+| Job | What it proves |
+|---|---|
+| **Syntax checks** | every Python module compiles, every extension script parses, `manifest.json` + `docker-compose.yml` are valid |
+| **Scenario suite** (Ubuntu **and** Windows) | the regression suite above passes on both platforms — the “runs anywhere” claim is checked, not assumed |
+| **Docker** | the image builds, a real `docker run` serves `/api/status`, `fbctl` works inside the container, and the suite passes in there too |
+
+If you push this folder as its own repository, the workflow is already in place
+(the file must sit at the repository root — move the `.github/` folder up one
+level if you keep the app inside a parent directory).
+
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Popup: backend not connected | Worker not running, wrong WebSocket URL (popup field), or port not mapped (Docker: `-p 8765:8765`). |
+| Popup: backend not connected | Worker not running, wrong WebSocket URL (popup field), or port not mapped (Docker: `-p 8766:8765`, so the popup needs `ws://localhost:8766`). |
 | Dashboard unreachable | Plain Python binds `127.0.0.1` by default — use `FB_COPIER_HTTP_HOST=0.0.0.0` (Docker does this automatically). |
 | Scan finds nothing | Source tab must be logged in and able to scroll; try Scan Now / `fbctl scan`. |
 | Posts queued but not posted | Check `active_hours`, the daily cap (`fbctl status` shows queue + today), and the cooldown. |
 | Post All stops after one post | Fixed in v9.1 (30 s-per-tab stall). The popup result line shows the first error. |
 | Post All posted something twice | Only possible if you retried an item marked ⚠ (status unknown). Verify on Facebook first; v9.1 blocks overlapping runs and duplicate content keys. |
-| Docker: container healthy but nothing posts | The extension must be loaded in Firefox on the machine that reaches port 8765. `docker compose logs -f` shows each cycle. |
+| Docker: container healthy but nothing posts | The extension must be loaded in Firefox on the machine that reaches the published WebSocket port (`docker ps` → `0.0.0.0:8766->8765/tcp`), with that same URL in the popup. `docker compose logs -f` shows each cycle. |
 | No notifications arriving | Check `notify_provider`, run `fbctl notify-test`, and confirm the container can reach the provider (outbound network). Telegram needs the token env var; the dashboard only stores the chat id. |
+| `docker compose up` fails while building | The first build needs network for `pip install`. Behind a proxy set `HTTP_PROXY`/`HTTPS_PROXY` for the build; offline, build on a machine that has network and move the image with `docker save`/`docker load`. |
+| Linux: `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock` | Your user isn't in the `docker` group: `sudo usermod -aG docker "$USER"`, then log out/in (or `newgrp docker`). Until then use `sudo docker …`. |
+| `docker ps` shows the container `(healthy)` but nothing answers on `localhost:5000` (and `PORTS` is empty) | The chosen host port was already in use, so Docker published none of them. Free the port or remap it (`FB_COPIER_WS_PUBLISH=9000 docker compose up -d`) and update the popup URL. `sudo ss -ltnp \| grep 8765` shows what is holding it. |
+| Import says “not a FB Post Copier backup” | You picked the wrong file — it needs the JSON produced by Export (with `settings` and `posts` keys). The dashboard shows the count of restored posts/settings on success. |
 | Timezone wrong for active hours | Set `TZ` in `docker-compose.yml` (Docker) or the OS timezone (plain Python). |
 
-## 8. Important notes
+## 10. Important notes
 
 * Browser automation of Facebook may violate its Terms of Service and can get
   an account restricted. Keep rates conservative (small batch, long cooldown,

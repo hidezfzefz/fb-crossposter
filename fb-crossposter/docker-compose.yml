@@ -4,8 +4,13 @@
 #   docker compose logs -f            watch the automation log
 #   docker compose down               stop
 #
-# The extension connects to ws://localhost:8765; the dashboard is on
-# http://localhost:5000 (also usable with: docker compose exec fb-post-copier python fbctl.py status).
+# Host ports: the dashboard is on http://localhost:5000 and the extension connects
+# to ws://localhost:8766 (set that URL in the extension popup).
+# 8766 rather than 8765 on purpose: 8765 is a common port for other local tools, and
+# if something else already holds it Docker silently starts the container with NO
+# published ports at all. Port is already in use? Pick another:
+#   FB_COPIER_WS_PUBLISH=9000 docker compose up -d
+# (also usable: docker compose exec fb-post-copier python fbctl.py status)
 services:
   fb-post-copier:
     build: ./python_backend
@@ -13,8 +18,8 @@ services:
     container_name: fb-post-copier
     restart: unless-stopped
     ports:
-      - "8765:8765"   # WebSocket for the Firefox extension
-      - "5000:5000"   # dashboard + fbctl
+      - "${FB_COPIER_WS_PUBLISH:-8766}:8765"   # WebSocket for the Firefox extension
+      - "5000:5000"                            # dashboard + fbctl
     environment:
       # Farm starts as soon as the extension connects (remove to control manually).
       FB_COPIER_AUTOSTART: "true"

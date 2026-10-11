@@ -623,9 +623,21 @@ def _run_coro(coro):
     return fut
 
 
+def ws_hint() -> str:
+    """The URL to put in the extension popup, from the user's point of view.
+
+    Inside Docker the container listens on WS_PORT but the browser has to use the
+    *published* host port, which the container cannot know — so say so instead of
+    showing a URL that would not answer.
+    """
+    if os.path.exists("/.dockerenv"):
+        return f"ws://localhost:{WS_PORT} — in Docker use the published host port (see docker ps)"
+    return f"ws://localhost:{WS_PORT}"
+
+
 @app.route("/")
 def dashboard():
-    return DASHBOARD_HTML
+    return DASHBOARD_HTML.replace("__WS_HINT__", ws_hint())
 
 
 @app.route("/api/status")
@@ -1221,7 +1233,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>FB Post Copier</h1>
-<div class="sub">Python backend &mdash; WebSocket <code>ws://localhost:8765</code> &middot; Dashboard <code>http://localhost:5000</code></div>
+<div class="sub">Python backend &mdash; WebSocket <code>__WS_HINT__</code> &middot; Dashboard <code>http://localhost:5000</code></div>
 
 <div class="grid">
   <div class="card">
