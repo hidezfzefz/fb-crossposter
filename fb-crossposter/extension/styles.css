@@ -1,0 +1,9 @@
+.fb-copier-btn-container{position:absolute!important;top:8px!important;right:8px!important;z-index:99999!important;display:flex!important;gap:6px!important}
+.fb-copier-btn{padding:6px 12px;background:#16a34a;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.2);white-space:nowrap;position:relative!important;display:inline-block!important}
+.fb-copier-btn:hover{background:#15803d;transform:scale(1.05)}
+.fb-copier-btn.add-btn{background:#2563eb}
+.fb-copier-btn.add-btn:hover{background:#1d4ed8}
+.fb-copier-btn.copying{background:#ca8a04!important}
+.fb-copier-btn.done{background:#16a34a!important}
+.fb-copier-btn.error{background:#dc2626!important}
+.fb-copier-post{position:relative!important}

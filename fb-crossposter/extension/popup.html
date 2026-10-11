@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+body{font-family:sans-serif;width:380px;padding:12px;margin:0;background:#f9fafb}
+h2{margin:0 0 12px;font-size:16px;color:#111827}
+.section{border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:10px;background:#fff}
+.section-title{font-size:11px;font-weight:700;color:#6b7280;margin-bottom:8px;text-transform:uppercase}
+.field{margin-bottom:8px}
+label{display:block;font-size:12px;font-weight:600;color:#4b5563;margin-bottom:2px}
+input[type=text],input[type=number]{width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;box-sizing:border-box}
+.btn{width:100%;padding:8px;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;margin-top:4px}
+.btn-primary{background:#16a34a;color:#fff}.btn-blue{background:#2563eb;color:#fff}.btn-red{background:#dc2626;color:#fff}.btn-gray{background:#6b7280;color:#fff}
+.inv-item{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:4px;font-size:12px;background:#f9fafb}
+.inv-text{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-right:8px;color:#374151}
+.inv-remove{background:#dc2626;color:#fff;border:none;border-radius:4px;padding:2px 6px;font-size:11px;cursor:pointer}
+.status{text-align:center;font-size:12px;color:#16a34a;margin-top:6px;min-height:16px}
+.empty{text-align:center;color:#9ca3af;font-size:12px;padding:12px}
+.conn{font-size:12px;padding:6px;border-radius:6px;text-align:center;margin-bottom:8px}
+.conn.yes{background:#dbeafe;color:#1e40af}
+.conn.no{background:#fee2e2;color:#991b1b}
+</style></head><body>
+<h2>📋 FB Post Copier</h2>
+<div id="connStatus" class="conn no">🔴 Python backend not connected (optional)</div>
+
+<div class="section"><div class="section-title">📦 Inventory</div>
+<div id="invList"><div class="empty">Click "➕ Add" on any post to queue it.</div></div>
+<button class="btn btn-blue" id="postAll">📤 Post All (0)</button>
+<button class="btn btn-red" id="clearInv" style="margin-top:4px">🗑 Clear</button>
+</div>
+
+<div class="section"><div class="section-title">Groups</div>
+<div class="field"><label>Source Group (FROM)</label><input type="text" id="sourceUrl"></div>
+<div class="field"><label>Target Group (TO)</label><input type="text" id="targetUrl"></div>
+</div>
+
+<div class="section"><div class="section-title">🐍 Python Backend</div>
+<div class="field"><label>WebSocket URL</label><input type="text" id="wsUrl" placeholder="ws://localhost:8765"></div>
+<div id="pyStats" style="font-size:11px;color:#4b5563;min-height:14px"></div>
+</div>
+
+<button class="btn btn-primary" id="save">Save Settings</button>
+<button class="btn btn-gray" id="resetDedup" style="margin-top:4px">♻ Reset dedup history</button>
+<div class="status" id="status"></div>
+<p style="font-size:11px;color:#9ca3af;margin-top:8px;text-align:center">Auto-farm needs the Python backend:<br><code>python3 server.py</code> &middot; Dashboard: <a href="http://localhost:5000" target="_blank">localhost:5000</a></p>
+<script src="popup.js"></script>
+</body></html>

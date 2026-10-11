@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "name": "FB Post Copier",
+  "version": "9.2",
+  "description": "Copy posts from one Facebook group to another. Auto-farm via optional Python backend.",
+  "permissions": ["activeTab", "tabs", "storage", "unlimitedStorage", "notifications", "<all_urls>"],
+  "browser_action": { "default_popup": "popup.html", "default_title": "FB Post Copier" },
+  "background": { "scripts": ["background.js"], "persistent": true },
+  "content_scripts": [{
+    "matches": ["*://*.facebook.com/*"],
+    "js": ["content.js"],
+    "css": ["styles.css"],
+    "run_at": "document_idle"
+  }],
+  "browser_specific_settings": { "gecko": { "id": "fb-post-copier@example.com", "strict_min_version": "60.0" } }
+}
